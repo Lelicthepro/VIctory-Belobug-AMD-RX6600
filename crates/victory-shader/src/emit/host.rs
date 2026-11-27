@@ -998,6 +998,9 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
+            // The creation-time clear value only describes a fast clear;
+            // untouched pixels need an actual clear before a partial draw.
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
