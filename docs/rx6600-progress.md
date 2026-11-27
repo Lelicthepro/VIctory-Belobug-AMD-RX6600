@@ -172,3 +172,56 @@ La comprobación completa del frontend también pasa:
 `cargo check --locked --target x86_64-pc-windows-msvc -p victory
 --features diagnostics,blake3/pure`. Comprueba el frontend, loader y HLE;
 no constituye una compilación enlazada de distribución.
+
+
+## Functional graphics follow-up — 2026-11-27
+
+Base requested: `698dd17`. All changes below are on the experimental branch.
+No game executables, assets, or derived caches were used.
+
+| Commit | Change | Evidence |
+| --- | --- | --- |
+| 50465b2 | Create the display compositor only after swap-chain resize/format invalidation | Static review: the old path could construct a compositor, discard it on format change, then construct another |
+| b2f2cec | Worklist closure for live SSA joins during interpolation analysis | Independent Python model compared closures on 1,000 seeded random graphs; adversarial reverse chain: 100,030,002 full-scan entries checked vs 10,001 worklist nodes visited; identical live sets |
+| 36cf17a | Extend display-plane readback with distinct and reused slots, changed dimensions and colors | Windows GPU test added, not executed |
+| f556f56 | Readback fixture combining translated mesh and pixel stages with visible, culled and edge-flagged geometry and changed target sizes/colors | Windows GPU test added, not executed |
+
+The graph comparison measures algorithmic work in a model, not compiled Rust,
+shader compilation time, RAM, GPU time or FPS. No translator semantics or
+cache version intentionally changed by the closure optimization. The new Rust
+regression also checks reachable loops and a disconnected dead cycle.
+
+The compositor fix removes redundant shader/PSO creation on a particular
+format transition; it does not change the format, presentation clock, or
+fallback. Its added fixture covers composition and descriptor-slot reuse
+after synchronous execution; it does not exercise the complete swap-chain
+resize path. The mesh/pixel test covers small generated triangles, not a
+full 3D world, lighting or video decoding.
+
+### Remaining correctness risks
+
+- The shared per-frame PSO wait budget in `pipeline/make.rs` can be consumed
+  by one recorder. Other recorders may return with a pending pipeline.
+  Screen passes have a separate budget and dedicated workers, but this does
+  not guarantee execution of every unique pass. A sound fix needs a
+  controlled pass-dependency reproduction and comparison of prewarming,
+  bounded waiting and deferred submission. No budget is reduced or
+  watchdog disabled in this follow-up.
+- `emit/lower.rs::fill_phis` explicitly documents the non-strict path that
+  can substitute zero for unsupported values through nested live joins.
+  Strict mode exposes other unsupported cases. This follow-up does not
+  enable strict mode by default or claim to solve the missing shader
+  operations.
+- Physical memory/VRAM measurements, complete vertex/compute/mesh
+  interoperability, depth/material/light correctness, streaming,
+  generated video decoding and A/V synchronization still need validation.
+
+### Validation status
+
+The follow-up environment is Linux, with no Rust toolchain on PATH and
+no accessible physical D3D12 device. No Rust build, Windows executable,
+GPU test, frame-rate measurement or visual result was produced here.
+Existing earlier test results are not counted as validation of these
+new commits. Run the Windows commands above and the new regression
+tests before promoting the branch. Preserve all security and resource
+lifetime safeguards.
