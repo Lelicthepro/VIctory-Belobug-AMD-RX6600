@@ -225,3 +225,45 @@ Existing earlier test results are not counted as validation of these
 new commits. Run the Windows commands above and the new regression
 tests before promoting the branch. Preserve all security and resource
 lifetime safeguards.
+
+
+## Validación física y semántica de uniones SSA sobre 32074f4
+
+GitHub y Git devolvieron la misma punta de partida de rx6600-optimization,
+32074f46ec91a93d4cb87afaee3e881c8367e531. Se probó en Windows 11 Pro 26300,
+Ryzen 5 5600G (6/12), RX 6600 con 8 GB y controlador 32.0.21045.29003,
+con 16 GiB de RAM instalada. Rust 1.98.1, MSVC y DXC del SDK 10.0.26100.0.
+
+- RX-001, 1b9da74. La prueba heredada fallaba en el baseline sin modo
+  estricto: una lectura escalar directa producía un diagnóstico, pero el
+  mismo dato cruzando dos uniones se aceptaba y podía convertirse en cero.
+  La propagación ahora alcanza los operandos que suministran los
+  predecesores emitidos de uniones numéricas y booleanas. Los masks ya
+  se resuelven por separado. La regresión comprueba el diagnóstico
+  equivalente y que una lectura realmente muerta sigue traduciendo.
+  Esto no implementa s_memtime ni demuestra cobertura de todas las
+  combinaciones de phi. Suite RX 6600 en serie: 306 aprobadas, 0 fallidas,
+  3 ignoradas.
+- RX-002, ef71bac. El caso de mesh y pixel traducidos ahora compara
+  cobertura espacial, geometría eliminada por culling, bordes y colores.
+  Seis cambios de escena, cuatro a 1920 × 1080, pasaron en RX 6600 y WARP.
+  La primera medición física fue 572,05 ms para los seis casos, incluyendo
+  traducción, inicialización de recursos, comandos, fence y readback.
+  No es una medida de FPS ni demuestra reproducción multimedia.
+
+Para reproducir desde este checkout en Windows con el SDK instalado:
+
+```powershell
+$env:VICTORY_ADAPTER = 'RX 6600'
+$env:VICTORY_PC_DXC = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe'
+cargo test -p victory-shader --locked --offline a_missing_value_stays_missing_through_two_live_joins -- --nocapture
+cargo test -p victory-shader --locked --offline translated_mesh_and_pixel_scene_transitions_render_expected_colors -- --nocapture
+cargo test -p victory-gpu --features diagnostics --locked --offline composes_scaled_premultiplied_plane_on_gpu -- --nocapture
+cargo build --release -p victory --locked --offline
+cargo build --profile diag -p victory --features diagnostics --locked --offline
+```
+
+Quedan sin validar con escenas complejas: pases dependientes en una lista
+con PSO todavía pendiente, integración 3D con texturas, luces y profundidad,
+decodificación de vídeo y A/V, presión real de memoria y tiempos sostenidos.
+No se usaron juegos, datos derivados ni cambios en las políticas de seguridad.
