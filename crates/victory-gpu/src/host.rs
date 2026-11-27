@@ -609,7 +609,10 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        // Do not shorten the existing GPU lifetime margin merely because
+        // memory admission is automatically enabled on a smaller PC.
+        let explicit = std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1");
+        let default = if explicit && crate::residency::limited_host_ram() { 16 } else { 64 };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
 }
