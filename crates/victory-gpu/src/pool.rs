@@ -796,7 +796,11 @@ mod tests {
     fn empty_blocks_stay_while_the_card_has_room() {
         let budget = 24 * (1u64 << 30);
         assert_eq!(spares(Some([budget, budget * 84 / 100, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([budget, budget * 85 / 100, 0, 0]), true), SPARE);
+        // The policy falls back at 85%. For this byte count the threshold
+        // lies between two integers, so test both adjacent byte counts.
+        let threshold = (budget * 85).div_ceil(100);
+        assert_eq!(spares(Some([budget, threshold - 1, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([budget, threshold, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([budget, budget / 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
