@@ -254,7 +254,7 @@ con 16 GiB de RAM instalada. Rust 1.98.1, MSVC y DXC del SDK 10.0.26100.0.
 Para reproducir desde este checkout en Windows con el SDK instalado:
 
 ```powershell
-$env:VICTORY_ADAPTER = 'RX 6600'
+$env:VICTORY_D3D12_ADAPTER = 'RX 6600'
 $env:VICTORY_PC_DXC = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe'
 cargo test -p victory-shader --locked --offline a_missing_value_stays_missing_through_two_live_joins -- --nocapture
 cargo test -p victory-shader --locked --offline translated_mesh_and_pixel_scene_transitions_render_expected_colors -- --nocapture
