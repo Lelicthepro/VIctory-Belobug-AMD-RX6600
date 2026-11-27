@@ -488,17 +488,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .filter(|(s, _)| !folded.contains(s))
         .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
         .collect();
-    loop {
-        let before = used.len();
-        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
-            if used.contains(&phi.value) {
-                used.extend(&phi.args);
-            }
-        }
-        if used.len() == before {
-            break;
-        }
-    }
+    follow_live_joins(&mut used, |v| {
+        phis.get(&v).map(|&(b, i)| p.blocks[b].phis[i].args.as_slice())
+    });
     for (site, attribute) in first_halves {
         if !io.interps.iter().any(|(s, _)| *s == site)
             && p.blocks[site.0].insts[site.1]
@@ -510,6 +502,26 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         }
     }
     Ok(io)
+}
+
+/// Find the transitive closure of live SSA values through control-flow
+/// joins. Each reachable value is visited once, including loop back edges.
+/// A repeated full scan of all phis can take quadratic work for a long
+/// chain ordered opposite to its uses.
+fn follow_live_joins<'a>(
+    used: &mut std::collections::HashSet<Value>,
+    args: impl Fn(Value) -> Option<&'a [Value]>,
+) {
+    let mut work: Vec<Value> = used.iter().copied().collect();
+    while let Some(v) = work.pop() {
+        if let Some(incoming) = args(v) {
+            for &a in incoming {
+                if used.insert(a) {
+                    work.push(a);
+                }
+            }
+        }
+    }
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -772,6 +784,28 @@ mod tests {
                 ((0, 2), Interp::Weighted { attribute }),
             ]
         );
+    }
+
+    #[test]
+    fn live_join_worklist_handles_deep_chains_and_cycles_without_repeated_scans() {
+        use std::collections::{HashMap, HashSet};
+        let mut joins: HashMap<Value, Vec<Value>> = (1..=10_000)
+            .map(|n| (Value(n), vec![Value(n - 1)]))
+            .collect();
+        // A loop back-edge is reachable; a separate cycle is dead.
+        joins.get_mut(&Value(1)).unwrap().push(Value(10_000));
+        joins.insert(Value(10_001), vec![Value(10_002)]);
+        joins.insert(Value(10_002), vec![Value(10_001)]);
+        let mut live = HashSet::from([Value(10_000)]);
+        let visits = std::cell::Cell::new(0usize);
+        follow_live_joins(&mut live, |v| {
+            visits.set(visits.get() + 1);
+            joins.get(&v).map(Vec::as_slice)
+        });
+        assert_eq!(live.len(), 10_001);
+        assert_eq!(visits.get(), live.len());
+        assert!(live.contains(&Value(0)));
+        assert!(!live.contains(&Value(10_001)));
     }
 
     #[test]
