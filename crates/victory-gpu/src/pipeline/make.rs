@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken from either speculative queue; released on completion or worker loss.
+    was_early: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -65,6 +67,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            was_early: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -307,11 +310,7 @@ fn lost(slot: usize) {
         }
     }
     let _ = p.made.set(None);
-    if p.was_slow.swap(false, Ordering::Relaxed) {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.slow_now = queue.slow_now.saturating_sub(1);
-        AVAILABLE.notify_all();
-    }
+    finish_speculation(&p);
     {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -522,7 +521,7 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (configured_workers() / 4).max(1)
         }
     })
 }
@@ -536,6 +535,7 @@ struct Queue {
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
+    early_now: usize,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -546,6 +546,7 @@ impl Queue {
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
+            early_now: 0,
             requested: VecDeque::new(),
         }
     }
@@ -574,19 +575,26 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+    fn pop(&mut self, screens_only: bool, slow_limit: usize, early_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+            p = self.requested.pop_front();
+            if p.is_none() && self.early_now < early_limit {
+                p = unclaimed(&mut self.early);
+                if p.is_none() && self.slow_now < slow_limit {
+                    p = unclaimed(&mut self.slow);
+                    if let Some(p) = &p {
+                        p.was_slow.store(true, Ordering::Relaxed);
+                        self.slow_now += 1;
+                    }
+                }
                 if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
+                    p.was_early.store(true, Ordering::Relaxed);
+                    self.early_now += 1;
                 }
             }
         }
@@ -598,6 +606,23 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+
+/// Release both speculative counters exactly once, even if the compiler
+/// guard replaces a worker that did not return.
+fn finish_speculation(p: &Pending) {
+    let early = p.was_early.swap(false, Ordering::Relaxed);
+    let slow = p.was_slow.swap(false, Ordering::Relaxed);
+    if early || slow {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if early {
+            queue.early_now = queue.early_now.saturating_sub(1);
+        }
+        if slow {
+            queue.slow_now = queue.slow_now.saturating_sub(1);
+        }
+        AVAILABLE.notify_all();
+    }
+}
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -628,7 +653,7 @@ const SCREEN_WORKERS: usize = 2;
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(screens_only, slow_limit(), speculative_limit(configured_workers(), crate::residency::limited_host_ram())) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -645,17 +670,34 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// Keep the established worker count on larger hosts. On memory-limited
+/// hosts cap the automatic general worker count; explicit overrides remain.
+fn effective_workers(asked: Option<usize>, processors: usize, limited: bool) -> usize {
+    let n = worker_count(asked, processors);
+    if asked.is_none() && limited { n.min(3) } else { n }
+}
+
+fn configured_workers() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| effective_workers(
+        std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+        crate::residency::limited_host_ram(),
+    ))
+}
+
+/// At most one speculative compile on limited hosts. A single-worker
+/// explicit configuration still makes progress when no demand is queued.
+fn speculative_limit(workers: usize, limited: bool) -> usize {
+    if limited && workers > 1 { 1 } else { usize::MAX }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-        );
+        let workers = configured_workers();
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();
@@ -694,11 +736,7 @@ fn spawn_worker(screens_only: bool) -> bool {
                     let _compile = Compile::begin(slot, &p, screens_only);
                     p.make();
                 }
-                if p.was_slow.load(Ordering::Relaxed) {
-                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                    queue.slow_now -= 1;
-                    AVAILABLE.notify_all();
-                }
+                finish_speculation(&p);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {
@@ -743,6 +781,27 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    #[test]
+    fn limited_hosts_keep_capacity_for_demand_without_ignoring_explicit_worker_counts() {
+        assert_eq!(effective_workers(None, 12, true), 3);
+        assert_eq!(effective_workers(None, 12, false), 8);
+        assert_eq!(effective_workers(Some(6), 12, true), 6);
+        assert_eq!(speculative_limit(3, true), 1);
+        assert_eq!(speculative_limit(1, true), usize::MAX);
+        assert_eq!(speculative_limit(8, false), usize::MAX);
+        let mut queue = Queue::new();
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let second = Arc::new(Pending::new(Vec::new(), None));
+        queue.push_as(&early, EARLY, false);
+        queue.push_as(&second, EARLY, false);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 1).unwrap(), &early));
+        assert!(queue.pop(false, 1, 1).is_none());
+        assert_eq!(queue.push_as(&second, REQUESTED, false), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 1).unwrap(), &second));
+        assert!(!second.was_early.load(Ordering::Relaxed));
+        assert_eq!(queue.early_now, 1);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -798,11 +857,11 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &earlier));
+        assert!(queue.pop(false, 1, usize::MAX).is_none());
     }
 
     #[test]
@@ -816,16 +875,16 @@ mod tests {
         assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &quick));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &long));
+        assert!(queue.pop(false, 1, usize::MAX).is_none());
         assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &asked));
         assert!(!asked.was_slow.load(Ordering::Relaxed));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(queue.pop(false, 1, usize::MAX).is_none());
         queue.slow_now -= 1;
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &longer));
+        assert!(queue.pop(false, 1, usize::MAX).is_none());
     }
 
     /// Passes over the screen go before all others, and workers of their own
@@ -841,8 +900,8 @@ mod tests {
         let mut queue = Queue::new();
         assert_eq!(queue.push(&world, REQUESTED), Some(true));
         assert_eq!(queue.push(&screen, REQUESTED), Some(true));
-        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
-        assert!(queue.pop(true, 1).is_none());
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1, usize::MAX).unwrap(), &screen));
+        assert!(queue.pop(true, 1, usize::MAX).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, usize::MAX).unwrap(), &world));
     }
 }
