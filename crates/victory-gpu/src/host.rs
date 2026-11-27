@@ -6565,7 +6565,7 @@ impl HostList {
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
+                "a host command list did not close (HRESULT {:#010x}: {e})", e.code().0 as u32
             ));
         }
     }
@@ -9188,8 +9188,8 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
+                static FAILURES: crate::residency::BufferFailures = crate::residency::BufferFailures::new();
+                FAILURES.report("upload", &e, size);
                 None
             }
         }
@@ -10162,7 +10162,8 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                static FAILURES: crate::residency::BufferFailures = crate::residency::BufferFailures::new();
+                FAILURES.report("shared", &e, size);
                 None
             }
         }

@@ -54,6 +54,40 @@ static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
+/// Shared and upload heaps both consume host commit. Keep per-class totals
+/// while emitting at most one OOM warning per second for each class.
+pub(crate) struct BufferFailures {
+    next_log: AtomicU64,
+    oom: AtomicU64,
+}
+
+impl BufferFailures {
+    pub(crate) const fn new() -> Self {
+        Self { next_log: AtomicU64::new(0), oom: AtomicU64::new(0) }
+    }
+
+    fn record_oom(&self, now: u64) -> Option<u64> {
+        let total = self.oom.fetch_add(1, Ordering::Relaxed) + 1;
+        let next = self.next_log.load(Ordering::Relaxed);
+        (now >= next
+            && self.next_log.compare_exchange(next, now.saturating_add(1000),
+                Ordering::Relaxed, Ordering::Relaxed).is_ok()).then_some(total)
+    }
+
+    pub(crate) fn report(&self, kind: &'static str, error: &windows::core::Error, size: u64) {
+        if error.code() != windows::Win32::Foundation::E_OUTOFMEMORY {
+            tracing::warn!(kind, %error, size, "host buffer allocation failed");
+            return;
+        }
+        let now = crate::host::coarse_ms();
+        allocation_error(error);
+        if let Some(oom_total) = self.record_oom(now) {
+            tracing::warn!(kind, %error, size, oom_total,
+                commit_available_mib = sample_commit(now) >> 20, "host buffer allocation failed");
+        }
+    }
+}
+
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
         RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
@@ -210,6 +244,17 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_oom_burst_counts_every_failure_and_limits_diagnostics() {
+        let failures = BufferFailures::new();
+        assert_eq!(failures.record_oom(0), Some(1));
+        for _ in 0..10_000 {
+            assert_eq!(failures.record_oom(500), None);
+        }
+        assert_eq!(failures.record_oom(999), None);
+        assert_eq!(failures.record_oom(1000), Some(10_003));
+    }
 
     #[test]
     fn automatic_admission_targets_small_hosts_and_respects_explicit_switches() {

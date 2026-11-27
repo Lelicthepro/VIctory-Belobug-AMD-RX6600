@@ -121,18 +121,19 @@ fn ahead() -> usize {
 /// many blocks to make ahead (0: every block is ripe at once).
 #[derive(Clone, Copy)]
 struct Ripe {
+    grow: bool,
     started: u64,
     finished: u64,
     ahead: usize,
 }
 
 impl Ripe {
-    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0 };
+    const ALL: Ripe = Ripe { grow: true, started: 0, finished: 0, ahead: 0 };
 
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
         // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+        Ripe { grow: true, started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
     }
 
     fn is<B>(self, block: &Block<B>) -> bool {
@@ -226,6 +227,7 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
@@ -265,6 +267,7 @@ impl<B: Clone> Pool<B> {
         }
         let (i, start) = match found {
             Some(found) => found,
+            None if !ripe.grow => return None,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
@@ -279,7 +282,7 @@ impl<B: Clone> Pool<B> {
                 }
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
+            if ripe.grow && empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -405,13 +408,14 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
-        // while commit is short; those a draw samples now still get one.)
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
-        }
+    // Deferral is not an allocation failure. Look for a reusable slice
+    // without changing the shared pool's retry deadline for required work.
+    let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+    let policy = Ripe {
+        grow: !speculative || crate::residency::allow_staging_growth(false),
+        ..Ripe::ALL
+    };
+    let (piece, memory, again) = lock(&STAGING).take_ripe(bytes, 512, now(), policy, || {
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
@@ -742,6 +746,69 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "run alone on the physical RX 6600"]
+    fn physical_shared_oom_defers_speculative_upload_growth() {
+        use std::time::Instant;
+        use windows::Win32::Graphics::Dxgi::*;
+        let host = crate::host::host().expect("D3D12 host");
+        // SAFETY: the device and adapter are live for these queries.
+        let name = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            String::from_utf16_lossy(&adapter.GetDesc1().unwrap().Description)
+        };
+        assert!(name.starts_with("AMD Radeon RX 6600"), "{name}");
+        assert!(crate::residency::on());
+        assert!(crate::residency::allow_staging_growth(false), "available host commit");
+        let measured = &crate::host::MADE[0];
+        let start_count = measured.load(Ordering::Relaxed);
+        // Model a real shared allocation returning E_OUTOFMEMORY without
+        // exhausting Windows. The baseline only logged this HRESULT.
+        let baseline = std::env::var_os("VICTORY_TEST_SHARED_OOM_BASELINE").is_some();
+        if !baseline {
+            let failures = crate::residency::BufferFailures::new();
+            failures.report("shared", &windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_OUTOFMEMORY), BLOCK);
+        }
+        let started = Instant::now();
+        crate::texture::PICKING.set(Some(u64::MAX));
+        let first = staging(host, BLOCK / 2);
+        crate::texture::PICKING.set(None);
+        let speculative = measured.load(Ordering::Relaxed) - start_count;
+        assert_eq!(speculative, u64::from(baseline));
+        assert_eq!(first.is_some(), baseline);
+        let (owned, upload, offset, data) = first.unwrap_or_else(|| {
+            staging(host, BLOCK / 2).expect("demanded growth remains available")
+        });
+        // Reusing the other half must work even under the cooldown.
+        crate::texture::PICKING.set(Some(u64::MAX));
+        let (second, _, _, _) = staging(host, BLOCK / 2).expect("reuse on the same block");
+        crate::texture::PICKING.set(None);
+        assert_eq!(measured.load(Ordering::Relaxed) - start_count, 1);
+        let pattern = [13u8, 57, 159, 255];
+        let back = host.read_back_buffer(pattern.len() as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the slice covers the mapped upload, the list is open,
+        // and both allocations and the pool leases outlive execution.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, pattern.len());
+            list.list.CopyBufferRegion(&back, 0, &upload, offset, pattern.len() as u64);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the copy was fenced and wrote all four bytes.
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(mapped.cast::<u8>(), pattern.len()), pattern);
+            back.Unmap(0, None);
+        }
+        drop((owned, second));
+        println!("baseline={baseline} speculative_allocations={speculative} speculative_commit_bytes={} verified_bytes={} elapsed_ms={:.3}",
+            speculative * BLOCK, pattern.len(), started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
@@ -861,7 +928,7 @@ mod tests {
             made.set(made.get() + 1);
             Some(made.get())
         };
-        let at = |started, finished| Ripe { started, finished, ahead: 2 };
+        let at = |started, finished| Ripe { grow: true, started, finished, ahead: 2 };
         let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
