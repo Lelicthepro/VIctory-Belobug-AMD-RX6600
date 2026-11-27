@@ -13281,29 +13281,24 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        // A join that only another join reads is read wherever that one is. Left
-        // unmarked, a value without a DXIL form coming into it became zero without a
-        // word (the looked-up tint of the material resolve programs, whose size
-        // computation had no value, was zero in every lane that way).
-        // shortcut: only with `VICTORY_STRICT_JOINS` set (the offline pack
-        // listing sets it to count them): 40 programs that translate today
-        // stop by name with it (vehicle paint pixel shaders at "the first
-        // half of an interpolation", foliage mesh shaders); until those are
-        // lowered they keep drawing with that zero.
-        static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
-        let mut work: Vec<Value> = if strict {
-            self.read_phis.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
+        // Propagate reads through operands of emitted numeric/boolean joins.
+        // Mask joins have already been resolved from the structured masks,
+        // and predecessors without an emitted edge cannot supply an operand.
+        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
         while let Some(v) = work.pop() {
+            if !matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_))) {
+                continue;
+            }
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            for &a in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&a) && self.read_phis.insert(a) {
-                    work.push(a);
+            let block = &p.blocks[b];
+            for (&pred, &arg) in block.preds.iter().zip(&block.phis[i].args) {
+                if self.tail[pred].is_some()
+                    && self.phi_at.contains_key(&arg)
+                    && self.read_phis.insert(arg)
+                {
+                    work.push(arg);
                 }
             }
         }
@@ -13999,7 +13994,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ours marks joins read through joins only with VICTORY_STRICT_JOINS (40 programs stop otherwise)"]
     fn a_missing_value_stays_missing_through_two_live_joins() {
         let mut words = [
             0xF490_0180,
