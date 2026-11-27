@@ -2072,6 +2072,83 @@ mod tests {
         }
     }
 
+    /// Translate both the mesh and pixel stages from generated instructions,
+    /// instead of pairing the translated mesh with a hand-built host PS.
+    #[test]
+    #[cfg(windows)]
+    fn translated_mesh_and_pixel_scene_transitions_render_expected_colors() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+            D3D12_SHADER_VISIBILITY_MESH, D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let color_shader = |color: [f32; 4]| -> HostShader {
+            let mut words = Vec::new();
+            for (reg, value) in color.into_iter().enumerate() {
+                words.push(0x7E00_02FF | ((reg as u32) << 17)); // v_mov_b32 literal
+                words.push(value.to_bits());
+            }
+            words.extend([0xF800_180F, 0x0302_0100, 0xBF81_0000]);
+            let native = emit_native(&words, 0);
+            let target = SigElement {
+                name: "SV_Target".into(), index: 0, kind: 16, comp: 9,
+                interp: 0, row: Some(0), col: 0, cols: 4, usage: 15, half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        };
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(), size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on {label}; skipped");
+                continue;
+            }
+            for (prim, color, size, expected) in [
+                (TRIANGLE, [1.0, 0.5, 0.25, 1.0], (32, 16), [1.0, 0.5, 0.25, 1.0]),
+                (TRIANGLE | CULL, [0.0, 1.0, 0.0, 1.0], (16, 32), [0.0; 4]),
+                (TRIANGLE | EDGE_FLAGS, [0.25, 0.0, 1.0, 1.0], (64, 32), [0.25, 0.0, 1.0, 1.0]),
+            ] {
+                let ms = triangle_mesh(prim).unwrap();
+                let ps = color_shader(color);
+                let root = host.root_signature_for(&[
+                    (&ms, D3D12_SHADER_VISIBILITY_MESH),
+                    (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                ]).unwrap();
+                let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps.dxil).unwrap();
+                let out = host.draw(&root, &pso, &Draw {
+                    roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                    textures: &[], samplers: &[], vertices: &[], stride: 0,
+                    size, mesh_groups: 1,
+                }).unwrap_or_else(|e| panic!("{label}: scene transition: {e}"));
+                assert_eq!(out.len(), (size.0 * size.1) as usize);
+                assert!(out.iter().all(|pixel| *pixel == expected),
+                    "{label}: unexpected pixels for {prim:#x}, {size:?}");
+            }
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no mesh-capable device; scene transition readback not exercised");
+        }
+    }
+
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
     /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
     /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
