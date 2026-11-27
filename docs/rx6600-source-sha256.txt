@@ -1,0 +1,5 @@
+64f1913f2e974a3ca1cd52f17164e98d506edac7a15bb7530b76fc2ca8229b6d  crates/victory-gpu/src/lib.rs
+4e18878aaaec940e2e60ac7a1a14c18d34b9d30fbc8ef70349c853636994cd9c  crates/victory-gpu/src/shader_cache.rs
+9988502e056e3277559c52064d6dbbf669e01c0331b5766c4ca88a98f051f1c0  crates/victory-gpu/src/shader_cache/settings.rs
+4a1b22da3507c055c958d6f325deee4d7c2623d50781fbc4c42f9d5520feafa0  crates/victory-pipeline/src/cache.rs
+627de788af1c92da3fb893e29128655b35c464eaca21eacecea5038a2a062423  crates/victory-pipeline/src/lib.rs

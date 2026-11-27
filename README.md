@@ -34,6 +34,13 @@ VIctory is a compatibility layer, not a full-system hardware emulator. This fork
 
 These changes have been committed, but Windows builds and physical RX 6600 tests have not yet been verified.
 
+## Technical validation log
+
+See [the RX 6600 progress log](docs/rx6600-progress.md) for the inspected baseline,
+cache fixes, reproducible checks, unresolved graphics risks and physical-test
+limitations. Source checksums are in [the SHA-256 manifest](docs/rx6600-source-sha256.txt).
+Portable CPU tests do not establish GPU performance or complete rendering.
+
 ## Roadmap
 
 1. Establish reproducible measurements with original, authorized test scenes: frame time, peak committed memory, DXGI local/non-local usage, dropped work and pipeline latency.
