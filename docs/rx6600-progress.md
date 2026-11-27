@@ -267,3 +267,14 @@ Quedan sin validar con escenas complejas: pases dependientes en una lista
 con PSO todavía pendiente, integración 3D con texturas, luces y profundidad,
 decodificación de vídeo y A/V, presión real de memoria y tiempos sostenidos.
 No se usaron juegos, datos derivados ni cambios en las políticas de seguridad.
+
+
+### Repetición final en Windows
+
+El workspace completo terminó con 1.134 pruebas aprobadas, 0 fallidas y
+45 ignoradas. El ensayo del umbral de pool comprueba los dos bytes a ambos
+lados del 85 %, sin modificar la retención de producción. El arnés gráfico
+borra explícitamente el fondo. Las tres parejas del mismo escenario pasaron
+con la RX 6600 fijada. Mediana física: 502,23 ms en la base y 509,01 ms con
+la corrección SSA. Los rangos se solapan. Se enlazaron release y diag y
+ambos ejecutaron mediante el lanzador un PE x64 de prueba que devolvió 42.
