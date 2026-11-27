@@ -39,7 +39,9 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Up to [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// On local budgets of at most 12 GiB, optional empty blocks are capped at
+/// one eighth of the reported budget, with the existing minimum reserve.
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
@@ -70,7 +72,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            // Limit optional empty-block retention on smaller local-memory
+            // budgets. Preserve the original policy on larger budgets.
+            // This does not release occupied or resting blocks.
+            if budget <= 12 * (1u64 << 30) {
+                ((budget / 8 / BLOCK) as usize).clamp(SPARE, SPARE_KEPT)
+            } else {
+                SPARE_KEPT
+            }
+        }
         _ => SPARE,
     }
 }
@@ -783,10 +794,23 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        let budget = 24 * (1u64 << 30);
+        assert_eq!(spares(Some([budget, budget * 84 / 100, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([budget, budget * 85 / 100, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([budget, budget / 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn small_local_budgets_limit_optional_empty_blocks() {
+        let gib = 1u64 << 30;
+        assert_eq!(spares(Some([8 * gib, 4 * gib, 0, 0]), true), 16);
+        assert_eq!(spares(Some([7 * gib, 4 * gib, 0, 0]), true), 14);
+        assert_eq!(spares(Some([8 * gib, 7 * gib, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([8 * gib, 4 * gib, 0, 0]), false), SPARE);
+        assert_eq!(spares(Some([BLOCK, 0, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([12 * gib, 6 * gib, 0, 0]), true), 24);
+        assert_eq!(spares(Some([16 * gib, 8 * gib, 0, 0]), true), SPARE_KEPT);
     }
 
     #[test]
