@@ -1,7 +1,12 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Process-wide and bounded: separate Cache instances share admission too.
+// Hash collisions only serialize unrelated conversions, never share output.
+static CONVERSIONS: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
 
 use anyhow::{Context, Result};
 
@@ -50,6 +55,18 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
+        if path.is_file() {
+            tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+            return Ok(path);
+        }
+        // Check existence while holding admission through publication. Without
+        // this, simultaneous cold requests each allocate and convert the same
+        // input. This is process-local; atomic rename still protects readers
+        // from writers in other processes. Converters must not recurse into
+        // this cache while converting (a stripe could be held already).
+        let _conversion = CONVERSIONS[usize::from(key.0.as_bytes()[0])]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
@@ -135,6 +152,76 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    struct SlowUpper(Upper);
+
+    impl Converter for SlowUpper {
+        fn id(&self) -> &'static str {
+            "test.slow-upper"
+        }
+        fn version(&self) -> u32 {
+            self.0.version
+        }
+        fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.0.convert(input)
+        }
+    }
+
+    #[test]
+    fn concurrent_cold_requests_share_conversion_across_cache_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = SlowUpper(Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        });
+        let start = std::sync::Barrier::new(6);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let cache = Cache::open(tmp.path().join("cache")).unwrap();
+                    let conv = &conv;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        let path = cache.get_or_convert(conv, b"generated fixture").unwrap();
+                        assert_eq!(std::fs::read(path).unwrap(), b"GENERATED FIXTURE");
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        assert_eq!(conv.0.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_conversion_can_be_retried() {
+        struct Retry(AtomicUsize);
+        impl Converter for Retry {
+            fn id(&self) -> &'static str {
+                "test.retry"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    anyhow::bail!("generated conversion failure");
+                }
+                Ok(input.to_vec())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path()).unwrap();
+        let conv = Retry(AtomicUsize::new(0));
+        assert!(cache.get_or_convert(&conv, b"retry").is_err());
+        let path = cache.get_or_convert(&conv, b"retry").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"retry");
+        cache.get_or_convert(&conv, b"retry").unwrap();
+        assert_eq!(conv.0.load(Ordering::Relaxed), 2);
     }
 
     #[test]

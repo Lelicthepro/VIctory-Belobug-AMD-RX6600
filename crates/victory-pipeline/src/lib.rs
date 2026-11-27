@@ -19,5 +19,7 @@ pub trait Converter: Send + Sync {
     fn id(&self) -> &'static str;
     /// Bump whenever the output for a given input changes.
     fn version(&self) -> u32;
+    /// Runs under bounded cache admission. Implementations must not call
+    /// `Cache::get_or_convert` recursively: an admission stripe may be held.
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
