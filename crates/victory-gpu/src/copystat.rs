@@ -936,6 +936,16 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    let refused = crate::residency::oom_counts();
+    tracing::info!(
+        "memory, refused host work: {} upload and {} shared allocation failures, {} deferred \
+         during the per-size cooldown, {} command lists dropped after a Close refused with \
+         E_OUTOFMEMORY",
+        refused[0],
+        refused[1],
+        crate::residency::skipped_while_cooling(),
+        crate::host::CLOSES_REFUSED.load(Relaxed),
+    );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()

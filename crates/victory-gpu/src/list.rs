@@ -404,22 +404,42 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
+        // SAFETY: one of our lists, closed and submitted: nothing records
+        // into it until the title resets it.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        let failed = list.host.as_ref().is_some_and(|host| host.failed());
+        // A list whose Close was refused with E_OUTOFMEMORY is not submitted.
+        // Get its empty replacement first: if none is available, this title
+        // list is left untouched and simply drops out of the submission.
+        let replacement = if failed {
+            let Some(replacement) = fresh_list() else { continue };
+            replacement.close();
+            Some(replacement)
+        } else {
+            None
+        };
         let Some(fresh) = fresh_list() else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(old) = list.host.replace(fresh) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let (earlier, gate, uploads, state, host) = if failed {
+            // Dropping `old` and `earlier` discards every recording whose
+            // Close was refused. The empty list keeps this submission's place.
+            drop(old);
+            (Vec::new(), Vec::new(), Vec::new(), Default::default(),
+                replacement.expect("a replacement was made for a refused list"))
+        } else {
+            (earlier, gate, uploads, state, old)
+        };
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -476,24 +496,40 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
+        let list = this.cast_mut().cast::<List>();
+        // SAFETY: one of our lists, closed and submitted: nothing records
+        // into it until the title resets it.
+        let failed = unsafe { (*list).host.as_ref().is_some_and(|host| host.failed()) };
+        let replacement = if failed {
+            let Some(replacement) = fresh_list() else { continue };
+            replacement.close();
+            Some(replacement)
+        } else {
+            None
+        };
         let Some(fresh) = fresh_list() else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
-        let list = this.cast_mut().cast::<List>();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(old) = (*list).host.replace(fresh) else {
                 continue;
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            (host, uploads, state)
+            if failed {
+                // Nothing recorded into a list whose Close was refused
+                // reaches the card, but its place in the order is kept.
+                drop(old);
+                (replacement.expect("a replacement was made for a refused list"),
+                    Vec::new(), Default::default())
+            } else {
+                (old, uploads, state)
+            }
         };
         order.push(taken.len());
         taken.push((

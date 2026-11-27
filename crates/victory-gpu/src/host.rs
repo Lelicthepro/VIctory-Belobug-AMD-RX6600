@@ -863,6 +863,10 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Command lists whose Close was refused with `E_OUTOFMEMORY`. They are
+/// dropped instead of sent to the card; the run is not ended for them.
+pub(crate) static CLOSES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -1378,6 +1382,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A Close refused for lack of memory: never submit this list. The title
+    /// gets a fresh one at its next reset and keeps running.
+    failed: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4324,6 +4331,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                failed: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5373,7 +5381,11 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false);
+        let runs: Vec<&HostList> = runs.iter().copied().filter(|list| !list.failed()).collect();
+        if runs.is_empty() {
+            return;
+        }
+        let _ = self.submit(&runs, &[], false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -6564,10 +6576,30 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                // Memory ran out while the list was being recorded. Nothing
+                // in it is sent to the card: an unclosed list is not a valid
+                // submission, and retrying the same commands under the same
+                // pressure would only repeat the failure. The title sees an
+                // ordinary Close and is given a fresh list on its next Reset.
+                crate::residency::allocation_error(&e);
+                self.failed.store(true, Ordering::Relaxed);
+                let total = CLOSES_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if total <= 4 || total.is_power_of_two() {
+                    tracing::warn!(total, frame = crate::frame::current(), error = %e,
+                        "host command list not closed; skipping its submission");
+                }
+                return;
+            }
             fail(format_args!(
                 "a host command list did not close (HRESULT {:#010x}: {e})", e.code().0 as u32
             ));
         }
+    }
+
+    /// Whether this list's Close was refused with `E_OUTOFMEMORY`.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6596,6 +6628,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.changed_something();
+        self.failed.store(false, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
@@ -9141,8 +9174,11 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[0].fetch_add(1, Ordering::Relaxed);
-        MADE[1].fetch_add(size, Ordering::Relaxed);
+        // One refused size must not become thousands of failed D3D12 calls.
+        // The cooldown is per size class, so work of another size continues.
+        if crate::residency::throttled(size) {
+            return None;
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -9186,7 +9222,12 @@ impl Host {
             crate::book::made(b, || "an upload buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                MADE[0].fetch_add(1, Ordering::Relaxed);
+                MADE[1].fetch_add(size, Ordering::Relaxed);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 static FAILURES: crate::residency::BufferFailures = crate::residency::BufferFailures::new();
                 FAILURES.report("upload", &e, size);
@@ -10111,8 +10152,9 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[2].fetch_add(1, Ordering::Relaxed);
-        MADE[3].fetch_add(size, Ordering::Relaxed);
+        if crate::residency::throttled(size) {
+            return None;
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -10160,7 +10202,12 @@ impl Host {
             crate::book::made(b, || "a shared buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                MADE[2].fetch_add(1, Ordering::Relaxed);
+                MADE[3].fetch_add(size, Ordering::Relaxed);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 static FAILURES: crate::residency::BufferFailures = crate::residency::BufferFailures::new();
                 FAILURES.report("shared", &e, size);

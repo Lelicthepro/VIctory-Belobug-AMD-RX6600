@@ -341,8 +341,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it. Automatic on hosts where memory admission
+/// is automatic (16 GiB of RAM or less), which is the case whose critical log
+/// spent 891.8 ms per frame waiting for this lock; `VICTORY_TEXTURE_NO_WAIT=0`
+/// restores the waiting path, and `=1` forces it on anywhere.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -364,9 +366,26 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. A staging buffer that holds nothing
 /// yet is filled with what is there all the same ([`fill_unlocked`]): a list
 /// has recorded the upload from it by then.
+fn no_wait_default(setting: Option<&str>, admission: bool) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        // An unrecognised value keeps the old, waiting behaviour rather than
+        // silently changing coherence on a typo.
+        Some(_) => false,
+        None => admission,
+    }
+}
+
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    let setting = std::env::var_os("VICTORY_TEXTURE_NO_WAIT");
+    *ON.get_or_init(|| {
+        no_wait_default(
+            setting.as_deref().and_then(|value| value.to_str()),
+            crate::residency::on(),
+        )
+    })
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -1944,7 +1963,16 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{no_wait_default, with_title};
+
+    #[test]
+    fn no_wait_follows_memory_admission_unless_explicitly_overridden() {
+        assert!(no_wait_default(None, true));
+        assert!(!no_wait_default(None, false));
+        assert!(no_wait_default(Some("1"), false));
+        assert!(!no_wait_default(Some("0"), true));
+        assert!(!no_wait_default(Some("maybe"), true));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

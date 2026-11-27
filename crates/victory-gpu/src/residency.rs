@@ -11,6 +11,8 @@
 //! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
 //! Off, nothing here changes anything, except that for 500 ms after the card
 //! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -81,11 +83,89 @@ impl BufferFailures {
         }
         let now = crate::host::coarse_ms();
         allocation_error(error);
+        OOM_BY_CLASS[usize::from(kind == "shared")].fetch_add(1, Ordering::Relaxed);
+        SIZE_COOLDOWN.note(size, now);
         if let Some(oom_total) = self.record_oom(now) {
             tracing::warn!(kind, %error, size, oom_total,
+                fast_fails = fast_fails(),
                 commit_available_mib = sample_commit(now) >> 20, "host buffer allocation failed");
         }
     }
+}
+
+/// How long a size whose allocation was refused is not asked for again.
+/// Long enough to stop a burst of thousands of failed driver calls, short
+/// enough that required work resumes on its own next frame.
+const ALLOCATION_COOLDOWN_MS: u64 = 500;
+
+/// A refused allocation is retried by size, not by caller. Sizes are bucketed
+/// by powers of two: the critical log repeated 4 MiB shared buffers and
+/// 256 KiB upload buffers, while unrelated small allocations still had to be
+/// allowed through.
+struct SizeCooldown {
+    until: Mutex<BTreeMap<u64, u64>>,
+    fast_fails: AtomicU64,
+}
+
+impl SizeCooldown {
+    const fn new() -> Self {
+        Self { until: Mutex::new(BTreeMap::new()), fast_fails: AtomicU64::new(0) }
+    }
+
+    fn bucket(size: u64) -> u64 {
+        size.max(1).checked_next_power_of_two().unwrap_or(u64::MAX)
+    }
+
+    fn note(&self, size: u64, now: u64) {
+        let mut until = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        // A run with many different refused sizes must not grow this map
+        // without bound. Expired entries are of no use to anyone.
+        until.retain(|_, deadline| *deadline > now);
+        until.insert(Self::bucket(size), now.saturating_add(ALLOCATION_COOLDOWN_MS));
+    }
+
+    fn is_throttled(&self, size: u64, now: u64) -> bool {
+        self.until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::bucket(size))
+            .is_some_and(|&deadline| now < deadline)
+    }
+}
+
+static SIZE_COOLDOWN: SizeCooldown = SizeCooldown::new();
+
+/// Refusals by heap, for the diagnostics memory line: upload then shared.
+static OOM_BY_CLASS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn oom_counts() -> [u64; 2] {
+    [OOM_BY_CLASS[0].load(Ordering::Relaxed), OOM_BY_CLASS[1].load(Ordering::Relaxed)]
+}
+
+/// True when an allocation of this size failed recently and the caller
+/// should defer it instead of asking the driver again. Only the refused size
+/// class is held back; a different size still reaches D3D12.
+pub(crate) fn throttled(size: u64) -> bool {
+    let hit = SIZE_COOLDOWN.is_throttled(size, crate::host::coarse_ms());
+    if hit {
+        let n = SIZE_COOLDOWN.fast_fails.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            tracing::warn!(size, skipped = n, "skipping an allocation refused moments ago");
+        }
+    }
+    hit
+}
+
+fn fast_fails() -> u64 {
+    SIZE_COOLDOWN.fast_fails.load(Ordering::Relaxed)
+}
+
+/// Allocations deferred without another driver call because their size
+/// class was refused in the last [`ALLOCATION_COOLDOWN_MS`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn skipped_while_cooling() -> u64 {
+    fast_fails()
 }
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
@@ -244,6 +324,18 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_size_class_is_held_back_without_blocking_other_sizes() {
+        let cooldown = SizeCooldown::new();
+        cooldown.note(4 << 20, 10_000);
+        assert!(cooldown.is_throttled(4 << 20, 10_499));
+        assert!(cooldown.is_throttled((4 << 20) - 1, 10_499));
+        assert!(!cooldown.is_throttled(256 << 10, 10_499));
+        assert!(!cooldown.is_throttled(4 << 20, 10_500));
+        let count = SIZE_COOLDOWN.fast_fails.load(Ordering::Relaxed);
+        assert_eq!(fast_fails(), count);
+    }
 
     #[test]
     fn buffer_oom_burst_counts_every_failure_and_limits_diagnostics() {

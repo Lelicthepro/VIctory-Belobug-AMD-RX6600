@@ -767,8 +767,11 @@ mod tests {
         let baseline = std::env::var_os("VICTORY_TEST_SHARED_OOM_BASELINE").is_some();
         if !baseline {
             let failures = crate::residency::BufferFailures::new();
+            // The critical log repeated 4 MiB shared buffers. Refuse that
+            // size class, not the 64 MiB staging block the demanded path
+            // needs immediately afterwards.
             failures.report("shared", &windows::core::Error::from_hresult(
-                windows::Win32::Foundation::E_OUTOFMEMORY), BLOCK);
+                windows::Win32::Foundation::E_OUTOFMEMORY), 4 << 20);
         }
         let started = Instant::now();
         crate::texture::PICKING.set(Some(u64::MAX));
