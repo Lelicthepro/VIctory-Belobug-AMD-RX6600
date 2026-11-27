@@ -1,7 +1,8 @@
 //! Host-memory admission for speculative texture work and reusable upload storage.
 //!
 //! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
-//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
+//! values of the last). Enabled automatically on hosts with at most 16 GiB
+//! of physical RAM, or explicitly with `VICTORY_RESIDENCY=1` ([`on`]); the memory
 //! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
 //! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
 //! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
@@ -16,10 +17,26 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 const MIB: u64 = 1 << 20;
 
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+/// Automatically use memory admission on hosts with at most 16 GiB of
+/// physical RAM. Explicit settings retain their previous meaning.
+fn residency_default(setting: Option<&str>, total_phys: Option<u64>) -> bool {
+    match setting {
+        Some(value) => value == "1",
+        None => total_phys.is_some_and(|bytes| bytes != 0 && bytes <= 16 * GIB),
+    }
+}
+
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let setting = std::env::var_os("VICTORY_RESIDENCY");
+        let enabled = match setting.as_deref() {
+            Some(value) => value.to_str().is_some_and(|v| residency_default(Some(v), None)),
+            None => residency_default(None, memory_status().map(|s| s.ullTotalPhys)),
+        };
+        tracing::info!(enabled, automatic = setting.is_none(), "host memory admission policy");
+        enabled
+    })
 }
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
@@ -193,6 +210,18 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_admission_targets_small_hosts_and_respects_explicit_switches() {
+        assert!(residency_default(None, Some(16 * GIB)));
+        assert!(residency_default(None, Some(8 * GIB)));
+        assert!(!residency_default(None, Some(16 * GIB + 1)));
+        assert!(!residency_default(None, Some(32 * GIB)));
+        assert!(!residency_default(None, None));
+        assert!(!residency_default(None, Some(0)));
+        assert!(!residency_default(Some("0"), Some(16 * GIB)));
+        assert!(residency_default(Some("1"), Some(64 * GIB)));
+    }
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {
