@@ -333,5 +333,55 @@ mod tests {
             }
             eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
         }
+
+        // Simulate two later scene transitions with different plane sizes
+        // and contents. First use a distinct descriptor slot, then reuse
+        // slot zero only after execute has waited for the previous submission.
+        for (slot, width, scene_color, overlay_color, expected) in [
+            (1, 5, [0.0, 0.0, 1.0, 1.0], [0.25, 0.0, 0.0, 0.25], [64u8, 0, 191, 255]),
+            (0, 7, [1.0, 0.0, 0.0, 1.0], [0.0; 4], [255u8, 0, 0, 255]),
+        ] {
+            let base = texture(1);
+            let overlay = texture(2);
+            let output = texture(u64::from(width));
+            let list = host.new_list().unwrap();
+            let cmds = &list.list;
+            // SAFETY: generated textures, one open list, and no outstanding
+            // use of the selected slot after the previous synchronous execute.
+            unsafe {
+                cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &scene_color, None);
+                cmds.ClearRenderTargetView(host.rtv(Some(&overlay), None), &overlay_color, None);
+                cmds.ResourceBarrier(&[
+                    crate::host::transition(&base, target, read),
+                    crate::host::transition(&overlay, target, read),
+                ]);
+                compositor.record(
+                    host, slot, cmds,
+                    [(&base, format), (&overlay, format)],
+                    &output, (width, 1),
+                ).unwrap();
+                cmds.ResourceBarrier(&[crate::host::transition(
+                    &output, target, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let (buffer, footprint) =
+                    crate::capture::read_back(&host.device, cmds, &output).unwrap();
+                list.close();
+                host.execute(&[&list]);
+                host.device.GetDeviceRemovedReason().unwrap();
+                let mut mapped = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let bytes = std::slice::from_raw_parts(
+                    mapped.cast::<u8>().add(footprint.Offset as usize),
+                    width as usize * 4,
+                ).to_vec();
+                buffer.Unmap(0, None);
+                for (pixel, rgba) in bytes.chunks_exact(4).enumerate() {
+                    assert!(
+                        rgba.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+                        "transition slot {slot}, width {width}, pixel {pixel}: {rgba:?}",
+                    );
+                }
+            }
+        }
     }
 }
