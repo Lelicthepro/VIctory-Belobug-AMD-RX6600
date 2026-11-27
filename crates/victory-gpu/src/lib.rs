@@ -138,3 +138,8 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+// Exercise the platform-independent key encoding on hosts without D3D12.
+#[cfg(all(test, not(windows)))]
+#[path = "shader_cache/settings.rs"]
+mod shader_cache_settings_tests;

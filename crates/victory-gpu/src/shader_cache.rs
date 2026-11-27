@@ -19,6 +19,8 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too, and [`FORMAT`] bumped.
 
+mod settings;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,12 +133,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
         ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
+            settings::append(&mut bytes, name, std::env::var_os(name).as_deref());
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
@@ -560,6 +557,40 @@ mod tests {
         // Another build still needs its own translation.
         assert_eq!(cached(&cache, &[20u8; 32], container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_refresh_and_repair_translate_once_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [23u8; 32];
+        let container = b"generated refresh and repair fixture";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(shader())
+        };
+        assert_eq!(cached_by(&cache, &build, "old", container, translate, false), Ok(shader()));
+        let concurrent = |refresh| {
+            let start = std::sync::Barrier::new(6);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..6).map(|_| scope.spawn(|| {
+                    start.wait();
+                    cached_by(&cache, &build, "new", container, translate, refresh)
+                })).collect();
+                for handle in handles {
+                    assert_eq!(handle.join().unwrap(), Ok(shader()));
+                }
+            });
+        };
+        concurrent(true);
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        for entry in walk(dir.path()) {
+            std::fs::write(entry, b"VSH2 truncated generated fixture").unwrap();
+        }
+        concurrent(false);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
