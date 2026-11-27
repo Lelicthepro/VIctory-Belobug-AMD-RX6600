@@ -794,8 +794,8 @@ mod tests {
         let mut queue = Queue::new();
         let early = Arc::new(Pending::new(Vec::new(), None));
         let second = Arc::new(Pending::new(Vec::new(), None));
-        queue.push_as(&early, EARLY, false);
-        queue.push_as(&second, EARLY, false);
+        assert_eq!(queue.push_as(&early, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&second, EARLY, false), Some(true));
         assert!(Arc::ptr_eq(&queue.pop(false, 1, 1).unwrap(), &early));
         assert!(queue.pop(false, 1, 1).is_none());
         assert_eq!(queue.push_as(&second, REQUESTED, false), Some(false));
