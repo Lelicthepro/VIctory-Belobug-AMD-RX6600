@@ -9691,16 +9691,9 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
-                Ok(c) => p.composer = Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
-                    drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
-                }
-            }
-        }
+        // Resize/invalidate first: a format change destroys the composer.
+        // Creating it before the resize could compile both display shaders
+        // and a PSO only to discard them and create them again below.
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
