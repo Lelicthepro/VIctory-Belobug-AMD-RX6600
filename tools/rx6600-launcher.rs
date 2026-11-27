@@ -58,11 +58,16 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             .code()
             .unwrap_or(1));
     }
-    let config = root.join("Programa-local.txt");
+    let config_dir = root.join("Configuracion");
+    let config = config_dir.join("Programa-local.txt");
+    // A path saved by an earlier layout is still honoured; the next save
+    // writes it under Configuracion without deleting the old copy.
+    let legacy = root.join("Programa-local.txt");
     let previous = if change {
         None
     } else {
         fs::read_to_string(&config)
+            .or_else(|_| fs::read_to_string(&legacy))
             .ok()
             .map(|text| PathBuf::from(text.trim_end_matches(['\r', '\n'])))
             .filter(|path| valid(path))
@@ -131,6 +136,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             .map_err(|_| "No se pudo capturar la salida")??;
     }
     if remember && status.success() {
+        fs::create_dir_all(&config_dir)?;
         fs::write(config, target)?;
     }
     Ok(status.code().unwrap_or(1))
