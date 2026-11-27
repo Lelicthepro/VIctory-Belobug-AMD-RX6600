@@ -20,7 +20,7 @@
 //! must be added to `encode` and `decode` too, and [`FORMAT`] bumped.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The encoding of entries ([`encode`]), part of the key.
@@ -32,6 +32,13 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+// Bound the bookkeeping even for large scenes. Independent keys normally
+// use different locks; collisions serialize safely without sharing results.
+static TRANSLATION_LOCKS: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
+
+fn translation_lock(input: &[u8]) -> &'static Mutex<()> {
+    &TRANSLATION_LOCKS[usize::from(blake3::hash(input).as_bytes()[0])]
+}
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 /// Hits on entries an earlier build of the translator made (served as they
@@ -226,6 +233,11 @@ fn cached_by(
     refresh: bool,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
+    // Cache misses, damaged entries and refreshes of the same key must not
+    // run concurrently in this process. A second worker reads the result
+    // published by the first instead of doing the same expensive translation.
+    // The translator itself does not call this cache recursively.
+    let _translation = translation_lock(&input).lock().unwrap_or_else(|e| e.into_inner());
     let converter = Translate {
         translate,
         source,
@@ -520,6 +532,34 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail, false).is_err());
+    }
+
+    #[test]
+    fn concurrent_requests_translate_one_cold_shader_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [19u8; 32];
+        let container = b"generated concurrent cache fixture";
+        let runs = AtomicU64::new(0);
+        let start = std::sync::Barrier::new(6);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(shader())
+        };
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6).map(|_| scope.spawn(|| {
+                start.wait();
+                cached(&cache, &build, container, translate, false)
+            })).collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(shader()));
+            }
+        });
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        // Another build still needs its own translation.
+        assert_eq!(cached(&cache, &[20u8; 32], container, translate, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
