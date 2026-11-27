@@ -2121,12 +2121,17 @@ mod tests {
                 eprintln!("no mesh shaders on {label}; skipped");
                 continue;
             }
-            for (prim, color, size, expected) in [
-                (TRIANGLE, [1.0, 0.5, 0.25, 1.0], (32, 16), [1.0, 0.5, 0.25, 1.0]),
-                (TRIANGLE | CULL, [0.0, 1.0, 0.0, 1.0], (16, 32), [0.0; 4]),
-                (TRIANGLE | EDGE_FLAGS, [0.25, 0.0, 1.0, 1.0], (64, 32), [0.25, 0.0, 1.0, 1.0]),
+            let started = std::time::Instant::now();
+            let mut frames = 0;
+            for (prim, color, size, reach) in [
+                (TRIANGLE, [1.0, 0.5, 0.25, 1.0], (32, 16), 4.0),
+                (TRIANGLE | CULL, [0.0, 1.0, 0.0, 1.0], (16, 32), 4.0),
+                (TRIANGLE | EDGE_FLAGS, [0.25, 0.0, 1.0, 1.0], (1920, 1080), 2.0),
+                (TRIANGLE, [0.0, 1.0, 0.25, 1.0], (1920, 1080), 1.0),
+                (TRIANGLE | CULL, [1.0, 1.0, 1.0, 1.0], (1920, 1080), 2.0),
+                (TRIANGLE, [0.5, 0.25, 0.0, 1.0], (1920, 1080), 4.0),
             ] {
-                let ms = triangle_mesh(prim).unwrap();
+                let ms = triangle_mesh_to(prim, reach).unwrap();
                 let ps = color_shader(color);
                 let root = host.root_signature_for(&[
                     (&ms, D3D12_SHADER_VISIBILITY_MESH),
@@ -2138,10 +2143,25 @@ mod tests {
                     textures: &[], samplers: &[], vertices: &[], stride: 0,
                     size, mesh_groups: 1,
                 }).unwrap_or_else(|e| panic!("{label}: scene transition: {e}"));
-                assert_eq!(out.len(), (size.0 * size.1) as usize);
-                assert!(out.iter().all(|pixel| *pixel == expected),
-                    "{label}: unexpected pixels for {prim:#x}, {size:?}");
+                let (width, height) = size;
+                assert_eq!(out.len(), (width * height) as usize);
+                // The triangle starts at the bottom left in NDC. Use exact
+                // integer pixel centres and avoid the rasterizer's edge tie.
+                let threshold = (f64::from(reach) * f64::from(width) * f64::from(height)) as i64;
+                for (i, pixel) in out.iter().enumerate() {
+                    let x = i as u32 % width;
+                    let y = i as u32 / width;
+                    let d = i64::from(2 * x + 1) * i64::from(height)
+                        + i64::from(2 * (height - 1 - y) + 1) * i64::from(width);
+                    if (d - threshold).abs() <= i64::from(width.max(height)) {
+                        continue;
+                    }
+                    let expected = if prim & CULL == 0 && d < threshold { color } else { [0.0; 4] };
+                    assert_eq!(*pixel, expected, "{label}: {prim:#x}, {size:?}, ({x},{y})");
+                }
+                frames += 1;
             }
+            eprintln!("{label}: {frames} translated mesh/pixel frames with readback in {:?}", started.elapsed());
             ran += 1;
         }
         if ran == 0 {
